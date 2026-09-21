@@ -16,6 +16,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+import yaml
 
 from assignment.env import Environment
 from assignment.agent.tools import INVOKE_SKILL_TOOL
@@ -141,6 +142,7 @@ class Agent:
         self.tools: list[dict[str, Any]] = []
         self.finished = False
         self.steps_taken = 0
+        self.messages: list[dict[str, Any]] = []
 
         self.skills_path = Path(skills_path) if skills_path is not None else None
         self.skills: dict[str, dict[str, str]] = (
@@ -164,7 +166,60 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        if not skills_path.exists():
+            raise ValueError(f"skills path does not exist: {skills_path}")
+        if not skills_path.is_dir():
+            raise ValueError(f"skills path is not a directory: {skills_path}")
+
+        skills: dict[str, dict[str, str]] = {}
+        for skill_directory in sorted(skills_path.iterdir(), key=lambda path: path.name):
+            if not skill_directory.is_dir():
+                continue
+
+            skill_file = skill_directory / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(f"missing SKILL.md in skill directory: {skill_directory}")
+
+            content = skill_file.read_text(encoding="utf-8")
+            lines = content.splitlines()
+            if not lines or lines[0].strip() != "---":
+                raise ValueError(f"missing YAML frontmatter in {skill_file}")
+
+            try:
+                closing_delimiter = next(
+                    index
+                    for index, line in enumerate(lines[1:], start=1)
+                    if line.strip() == "---"
+                )
+            except StopIteration as exc:
+                raise ValueError(f"unterminated YAML frontmatter in {skill_file}") from exc
+
+            try:
+                frontmatter = yaml.safe_load("\n".join(lines[1:closing_delimiter]))
+            except yaml.YAMLError as exc:
+                raise ValueError(f"malformed YAML frontmatter in {skill_file}: {exc}") from exc
+            if not isinstance(frontmatter, dict):
+                raise ValueError(f"frontmatter must be a mapping in {skill_file}")
+
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"frontmatter name must be a non-empty string in {skill_file}")
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError(
+                    f"frontmatter description must be a non-empty string in {skill_file}"
+                )
+
+            name = name.strip()
+            description = description.strip()
+            if name in skills:
+                raise ValueError(f"duplicate skill name: {name}")
+            skills[name] = {
+                "metadata": f"name: {name}\ndescription: {description}",
+                "content": content,
+            }
+
+        return skills
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -227,7 +282,11 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        opening_messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.task_prompt},
+        ]
+        return opening_messages + deepcopy(self.messages)
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -336,7 +395,30 @@ class Agent:
             # and handles the threshold, and tracks compaction events for
             # logging.
 
-            raise NotImplementedError
+            while not self.finished:
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(
+                        f"Agent exceeded the step limit of {self.step_limit}."
+                    )
+
+                #self.maybe_compact_context()
+                action = self.query_language_model()
+                self.messages.append(deepcopy(action))
+
+                tool_calls = action.get("tool_calls")
+                if isinstance(tool_calls, list) and tool_calls:
+                    observations = self.execute_tool_calls(tool_calls)
+                    self.messages.extend(deepcopy(observations))
+                else:
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Continue working on the task. Use an available tool "
+                                "to act or report completion."
+                            ),
+                        }
+                    )
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.
